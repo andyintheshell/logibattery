@@ -41,8 +41,25 @@ jobs:
         run: |
           mkdir -p dist
           ditto -c -k --sequesterRsrc --keepParent LogiBattery.app dist/LogiBattery-universal-macos.zip
+          staging="$RUNNER_TEMP/dmg-staging"
+          mkdir -p "$staging"
+          ditto LogiBattery.app "$staging/LogiBattery.app"
+          ln -s /Applications "$staging/Applications"
+          cat > "$staging/READ ME.txt" <<'NOTES'
+          LogiBattery — macOS 13+ (Apple Silicon and Intel)
+
+          Drag LogiBattery.app to Applications, then eject this disk image.
+
+          WARNING: Not Developer ID-signed or notarized by Apple.
+          The app has only an ad-hoc integrity signature. Gatekeeper may block it.
+          Only open it if you trust this project. Do not disable Gatekeeper globally.
+          Source and build instructions: https://github.com/andyintheshell/logibattery
+          NOTES
+          hdiutil create -volname LogiBattery -srcfolder "$staging" \
+            -format UDZO -ov dist/LogiBattery-universal-macos.dmg
+          hdiutil verify dist/LogiBattery-universal-macos.dmg
           cd dist
-          shasum -a 256 LogiBattery-universal-macos.zip > SHA256SUMS.txt
+          shasum -a 256 LogiBattery-universal-macos.dmg LogiBattery-universal-macos.zip > SHA256SUMS.txt
       - uses: actions/upload-artifact@v4
         with:
           name: LogiBattery-universal-macos
@@ -70,13 +87,13 @@ jobs:
           cat > notes.md <<'NOTES'
           ## LogiBattery — universal macOS build
 
-          Download `LogiBattery-universal-macos.zip`, extract it, and move `LogiBattery.app` to `/Applications`. Requires macOS 13 or later; includes Apple Silicon (arm64) and Intel (x86_64).
+          Download `LogiBattery-universal-macos.dmg`, open it, drag `LogiBattery.app` onto the Applications shortcut, then eject the disk image. A ZIP is also available. Requires macOS 13 or later; includes Apple Silicon (arm64) and Intel (x86_64).
 
           **Warning: unsigned by an identified developer and not notarized by Apple.** The app has only an ad-hoc integrity signature, not a Developer ID signature. Gatekeeper may block it. Only open it if you trust this project; review the source or build locally if unsure. Do not disable Gatekeeper globally.
 
           Tested hardware: ERGO K860 and MX Ergo through a Unifying receiver. Bolt and direct Bluetooth support are unverified. Remaining-runtime figures are estimates.
 
-          `SHA256SUMS.txt` provides a checksum for the ZIP. This release is created as a draft for maintainer review, not automatically published.
+          `SHA256SUMS.txt` provides checksums for the DMG and ZIP. This release is created as a draft for maintainer review, not automatically published.
           NOTES
           gh release create "$RELEASE_TAG" dist/* \
             --target "$RELEASE_SHA" \

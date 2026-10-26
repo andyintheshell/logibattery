@@ -121,9 +121,14 @@ cd app
 open ../LogiBattery.app
 ```
 
+For a prebuilt download, open `LogiBattery-universal-macos.dmg`, drag the app to
+the Applications shortcut, then eject the disk image. A ZIP is also available;
+`SHA256SUMS.txt` contains checksums for both downloads. The DMG does not remove
+the signing/notarization warning above.
+
 For a universal build, use `ARCHS="arm64 x86_64" ./build.sh`. The GitHub Actions
 workflow checks universal builds on PRs targeting `release`, then attaches the
-zipped `.app` and SHA-256 checksum to a new draft release after a merge/push to
+DMG, zipped `.app`, and SHA-256 checksums to a new draft release after a merge/push to
 `release`. It can also be run manually on that branch. PR builds never create
 releases.
 
