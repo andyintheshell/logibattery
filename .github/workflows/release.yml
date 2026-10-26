@@ -1,0 +1,85 @@
+name: Universal macOS build
+
+on:
+  pull_request:
+    branches: [release]
+  push:
+    branches: [release]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: universal-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build universal app
+        env:
+          ARCHS: arm64 x86_64
+        run: bash app/build.sh
+      - name: Verify architectures and signature
+        run: |
+          for binary in LogiBattery.app/Contents/MacOS/LogiBattery app/build/hidprobe; do
+            archs="$(lipo -archs "$binary")"
+            echo "$binary: $archs"
+            grep -qw arm64 <<< "$archs"
+            grep -qw x86_64 <<< "$archs"
+          done
+          codesign --verify --strict --verbose=2 LogiBattery.app
+      - name: Smoke-test UI rendering without hardware
+        run: |
+          LogiBattery.app/Contents/MacOS/LogiBattery --dump-png "$RUNNER_TEMP/ui"
+          test -s "$RUNNER_TEMP/ui/menu-light.png"
+          test -s "$RUNNER_TEMP/ui/menu-dark.png"
+      - name: Package app
+        run: |
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent LogiBattery.app dist/LogiBattery-universal-macos.zip
+          cd dist
+          shasum -a 256 LogiBattery-universal-macos.zip > SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LogiBattery-universal-macos
+          path: dist/*
+          if-no-files-found: error
+
+  draft-release:
+    if: github.ref == 'refs/heads/release' && github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: LogiBattery-universal-macos
+          path: dist
+      - name: Create draft release with app and checksum
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_SHA: ${{ github.sha }}
+          RELEASE_TAG: build-${{ github.run_number }}-${{ github.run_attempt }}
+        run: |
+          cat > notes.md <<'NOTES'
+          ## LogiBattery — universal macOS build
+
+          Download `LogiBattery-universal-macos.zip`, extract it, and move `LogiBattery.app` to `/Applications`. Requires macOS 13 or later; includes Apple Silicon (arm64) and Intel (x86_64).
+
+          **Warning: unsigned by an identified developer and not notarized by Apple.** The app has only an ad-hoc integrity signature, not a Developer ID signature. Gatekeeper may block it. Only open it if you trust this project; review the source or build locally if unsure. Do not disable Gatekeeper globally.
+
+          Tested hardware: ERGO K860 and MX Ergo through a Unifying receiver. Bolt and direct Bluetooth support are unverified. Remaining-runtime figures are estimates.
+
+          `SHA256SUMS.txt` provides a checksum for the ZIP. This release is created as a draft for maintainer review, not automatically published.
+          NOTES
+          gh release create "$RELEASE_TAG" dist/* \
+            --target "$RELEASE_SHA" \
+            --title "LogiBattery $RELEASE_TAG (universal macOS)" \
+            --notes-file notes.md \
+            --draft

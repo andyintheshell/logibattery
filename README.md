@@ -104,12 +104,28 @@ the menu bar, and a dropdown holding the full breakdown.
 
 #### Build and run
 
+Requires macOS 13 or later. To download a prebuilt universal app (Apple Silicon
+and Intel), see [Releases](https://github.com/andyintheshell/logibattery/releases)
+when a maintainer has published one. CI creates **draft** releases from the
+`release` branch; drafts are not publicly downloadable until published.
+
+**Warning: prebuilt apps are not Developer ID-signed or notarized by Apple.**
+They carry only an ad-hoc integrity signature, so Gatekeeper may block them.
+Only open builds you trust; alternatively review the source and build locally.
+Do not disable Gatekeeper globally.
+
 ```sh
 cd app
 ./build.sh                 # → ../LogiBattery.app  (compile, icon, bundle, sign)
 ./build.sh --icons         # ...and keep the .iconset and PNG previews
 open ../LogiBattery.app
 ```
+
+For a universal build, use `ARCHS="arm64 x86_64" ./build.sh`. The GitHub Actions
+workflow checks universal builds on PRs targeting `release`, then attaches the
+zipped `.app` and SHA-256 checksum to a new draft release after a merge/push to
+`release`. It can also be run manually on that branch. PR builds never create
+releases.
 
 `build.sh` needs nothing but the Command Line Tools — no Xcode, no Developer
 account, no provisioning profile. It compiles the Swift sources, renders and
