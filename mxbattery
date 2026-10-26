@@ -1,0 +1,670 @@
+#!/usr/bin/env python3
+"""
+mxbattery - read the battery level of Logitech devices paired through a Unifying
+receiver, on macOS, and estimate how long they will last.
+
+The receiver exposes no "Battery" HID element, so this speaks HID++ 2.0 directly
+to the receiver's vendor interface (usage page 0xFF00) via IOKit. No compiler,
+no pip packages, no root, no entitlements, no TCC prompt.
+
+    ./mxbattery            # one block per paired device
+    ./mxbattery -b         # one line per device
+    ./mxbattery --json     # machine-readable output
+    ./mxbattery -v         # + dump raw HID++ frames
+    ./mxbattery --days 90  # force 90 days of runtime per charge for all devices
+    ./mxbattery --ascii    # plain characters, for terminals without block glyphs
+
+Each device's model is picked from its name, so the runtime estimate uses the
+right figures (a rechargeable mouse and an alkaline keyboard differ by ~6x).
+Sources for the per-device ranges are in the README; pass --days to override.
+
+Both the MX Ergo and the ERGO K860 report only 4 battery levels, so printing a
+percentage would be a lie. The charge bar is split instead: solid cells are
+charge we can prove is there, shaded cells are the band the true value is hiding
+somewhere inside, and the rest is definitely gone. Runtime is a range for the
+same reason.
+
+A paired device that has gone to sleep stops answering, but the receiver still
+remembers it, so the script lists it as "asleep or switched off" rather than
+silently omitting it.
+"""
+
+import json
+import os
+import re
+import sys
+import time
+from ctypes import (CDLL, CFUNCTYPE, POINTER, byref, c_bool, c_char_p, c_double,
+                    c_int32, c_int64, c_long, c_uint8, c_uint32, c_void_p)
+
+# ------------------------------------------------------------------ frameworks
+IOKIT = CDLL("/System/Library/Frameworks/IOKit.framework/IOKit")
+CF = CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+
+kCFAllocatorDefault = c_void_p.in_dll(CF, "kCFAllocatorDefault")
+kCFNumberSInt64Type = 4
+kCFStringEncodingUTF8 = 0x08000100
+
+# ------------------------------------------------------------------ constants
+LOGI_VID = 0x046D             # Logitech
+HIDPP_PAGE = 0xFF00           # vendor "Logitech" usage page -> HID++ interface
+HIDPP_USAGE = 0x01
+SW_ID = 0x09                  # any 4-bit id; echoed back, so pick one nobody else uses
+RID_SHORT, RID_LONG = 0x10, 0x11
+ERR_MARKER = 0x8F
+TIMEOUT = object()             # sentinel: no reply within the timeout
+
+FEAT_BATTERY_ST = 0x1000      # fn 0 -> [level%, next_level%, status]
+FEAT_UNIFIED_BATT = 0x1004    # fn 1 -> [discharge%, level_flags, status, -]
+LEVEL_FLAGS = {8: 100, 4: 50, 2: 15, 1: 5}   # UNIFIED_BATTERY level bits
+
+BATTERY_STATUS = ("discharging", "recharging", "almost full", "full",
+                  "slow recharge", "invalid battery", "thermal error")
+
+# 0x1000 GetBatteryCapability flags (HID++ 2.0 spec)
+CAP_DISABLE_OSD = 1 << 0
+CAP_MILEAGE = 1 << 1          # fine-grained reporting; ignored if levels < 10
+CAP_RECHARGEABLE = 1 << 2
+
+# Per-device runtime model.
+#
+# IMPORTANT: every figure below is CALENDAR time with the device powered on, not
+# "days of actual use". A paired device keeps drawing current while idle (radio
+# link upkeep, periodic wake-ups), so wall-clock time is what drains it. `self_a`
+# is the chemistry's own self-discharge, which runs even when switched off.
+#
+#   capacity  = nameplate mAh
+#   self_a    = self-discharge, microamps averaged (Li-Po also carries its
+#               protection circuit; alkaline is ~20x lower)
+#   active_a  = draw while actually moving/typing, microamps. Fitted, not
+#               measured - see README. None means "cannot be derived".
+#   scenarios = (label, days-per-charge low, high) off owner reports/ratings.
+MODELS = (
+    ("MX ERGO", "500 mAh Li-Po", 500, 30.0, 500.0,
+     (("powered on, daily use", 47, 63),
+      ("powered on, light use", 90, 120))),
+    ("ERGO K860", "2x AAA alkaline", 1100, 3.5, None,
+     (("powered on, typical use", 365, 730),)),
+)
+FALLBACK_MODEL = ("unknown battery", None, None, None, ())
+
+# Alkaline cells are rated ~10 years shelf life and can leak, so cap the
+# "switched off" figure rather than trusting pure self-discharge arithmetic.
+SHELF_CAP_MONTHS = 120
+
+# HID++ 2.0 spec, 0x1000 GetBatteryCapability: if a device reports fewer than 10
+# levels (or mileage is disabled) the firmware collapses its gauge to 4 bands and
+# sends that band's representative value, so a reading is a band, not a number.
+#   0-10% critical, 11-30% low, 31-80% good, 81-100% full
+GAUGE_BANDS = ((81, 100, "full"), (31, 80, "good"), (11, 30, "low"), (0, 10, "critical"))
+
+# -------------------------------------------------------------- ctypes glue
+Void = c_void_p
+I64 = c_int64
+InputCB = CFUNCTYPE(None, Void, c_int32, Void, c_uint32, c_uint32,
+                    POINTER(c_uint8), c_long)          # last arg is CFIndex
+
+
+def bind(fn, res, *args):
+    fn.restype, fn.argtypes = res, list(args)
+    return fn
+
+IOHIDManagerCreate = bind(IOKIT.IOHIDManagerCreate, Void, Void, c_uint32)
+IOHIDManagerSetDeviceMatching = bind(IOKIT.IOHIDManagerSetDeviceMatching, None, Void, Void)
+IOHIDManagerCopyDevices = bind(IOKIT.IOHIDManagerCopyDevices, Void, Void)
+IOHIDDeviceOpen = bind(IOKIT.IOHIDDeviceOpen, c_int32, Void, c_uint32)
+IOHIDDeviceClose = bind(IOKIT.IOHIDDeviceClose, c_int32, Void, c_uint32)
+IOHIDDeviceGetProperty = bind(IOKIT.IOHIDDeviceGetProperty, Void, Void, Void)
+IOHIDDeviceSetReport = bind(IOKIT.IOHIDDeviceSetReport, c_int32, Void,
+                            c_uint32, c_uint32, POINTER(c_uint8), c_long)
+IOHIDDeviceScheduleWithRunLoop = bind(IOKIT.IOHIDDeviceScheduleWithRunLoop, None, Void, Void, Void)
+IOHIDDeviceRegisterInputReportCallback = bind(
+    IOKIT.IOHIDDeviceRegisterInputReportCallback, None,
+    Void, POINTER(c_uint8), c_long, InputCB, Void)
+CFSetGetCount = bind(CF.CFSetGetCount, c_long, Void)
+CFSetGetValues = bind(CF.CFSetGetValues, None, Void, POINTER(Void))
+CFNumberGetValue = bind(CF.CFNumberGetValue, c_bool, Void, c_long, Void)
+CFRunLoopGetCurrent = bind(CF.CFRunLoopGetCurrent, Void)
+CFRunLoopRunInMode = bind(CF.CFRunLoopRunInMode, None, Void, c_double, c_bool)
+CFStringCreateWithCString = bind(CF.CFStringCreateWithCString, Void, Void, c_char_p, c_uint32)
+
+VERBOSE = False
+ASCII = False                 # --ascii: avoid glyphs some terminals lack
+COLOR = False                 # enabled in main() when stdout is a TTY
+
+
+def cfstr(s):
+    """CFStringRef from a Python str (leaked, but this is a short-lived script)."""
+    return CFStringCreateWithCString(None, s.encode(), kCFStringEncodingUTF8)
+
+
+def prop(dev, key):
+    """Numeric IOHID device property as a Python int (None if absent)."""
+    n = IOHIDDeviceGetProperty(dev, cfstr(key))
+    if not n:
+        return None
+    v = I64()
+    return v.value if CFNumberGetValue(n, kCFNumberSInt64Type, byref(v)) else None
+
+
+def find_receivers():
+    """Every Logitech HID++ interface (usage page 0xFF00, usage 1) on the system.
+    A USB hub may host several receivers, so this returns a list."""
+    mgr = IOHIDManagerCreate(kCFAllocatorDefault, 0)
+    IOHIDManagerSetDeviceMatching(mgr, None)     # enumerate all, filter below
+    devices = IOHIDManagerCopyDevices(mgr)
+    if not devices:
+        return []
+    n = CFSetGetCount(devices)
+    arr = (Void * n)()
+    CFSetGetValues(devices, arr)
+    return [arr[i] for i in range(n)
+            if prop(arr[i], "VendorID") == LOGI_VID
+            and prop(arr[i], "PrimaryUsagePage") == HIDPP_PAGE
+            and prop(arr[i], "PrimaryUsage") == HIDPP_USAGE]
+
+
+def model_for(name):
+    """(battery, capacity_mAh, self_a, active_a, scenarios) for a device name."""
+    upper = (name or "").upper()
+    for match, battery, cap, self_a, active_a, scen in MODELS:
+        if match in upper:
+            return battery, cap, self_a, active_a, scen
+    return FALLBACK_MODEL
+
+
+def band_for(percent):
+    """True state-of-charge range behind a coarse gauge reading, per the HID++
+    spec's 4-band collapse. Returns (low%, high%, label); for a fine-grained
+    gauge the reading is used as-is."""
+    for low, high, label in GAUGE_BANDS:
+        if percent >= low:
+            return low, high, label
+    return 0, 10, "critical"
+
+
+def fmt_range(low_days, high_days):
+    """Human units: months once the estimate reaches roughly a year."""
+    if high_days >= 330:
+        unit, scale, fmt = "months", 30.44, "%.0f"
+    elif high_days >= 2:
+        unit, scale, fmt = "days", 1.0, "%.0f"
+    else:
+        unit, scale, fmt = "hours", 1 / 24, "%.0f"
+    low, high = low_days / scale, high_days / scale
+    if round(low) == round(high):
+        return "%s %s" % (fmt % high, unit)
+    return "%s%s%s %s" % (fmt % low, dash(), fmt % high, unit)
+
+
+def fmt_scenarios(scenarios, soc_lo, soc_hi):
+    """Each scenario's days-per-charge scaled into the SoC band we can prove."""
+    return [(label, low * soc_lo / 100, high * soc_hi / 100)
+            for label, low, high in scenarios]
+
+
+def fmt_months(months):
+    """A single duration in months, switching to years once it is long."""
+    if months >= 24:
+        return "%.0f years" % (months / 12)
+    return "%.0f months" % months
+
+
+def fmt_pair(low, high, unit):
+    """`a-b unit`, or just `a unit` when both ends agree."""
+    if low == high:
+        return "%d %s" % (high, unit)
+    return "%d%s%d %s" % (low, dash(), high, unit)
+
+
+def pct_per_month(self_ua, capacity_mah):
+    """Self-discharge as % of capacity per month."""
+    return self_ua * 0.7305 / capacity_mah * 100
+
+
+def shelf_months(capacity_mah, self_ua):
+    """Months until empty on self-discharge alone (device switched off), capped
+    at the chemistry's shelf life."""
+    return min(SHELF_CAP_MONTHS, capacity_mah / (self_ua * 0.7305))
+
+
+def self_share(self_ua, capacity_mah, days):
+    """Share of one charge that leaks away unused over `days` calendar days."""
+    return self_ua * days * 24 / 1000 / capacity_mah * 100
+
+
+def active_hours(percent, capacity_mah, active_ua):
+    """Hours of actual movement/typing left in the charge."""
+    return capacity_mah * 1000 * percent / 100 / active_ua
+
+
+# ------------------------------------------------------------------ rendering
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+BAR_WIDTH = 20                # cells in a charge bar
+LABEL_WIDTH = 26              # scenario label column
+VALUE_WIDTH = 22              # scenario value column
+BLOCK_WIDTH = 62              # where the battery type is right-aligned
+BAND_COLOR = {"full": 32, "good": 36, "low": 33, "critical": 31}
+
+
+def style(text, *codes):
+    """Wrap in ANSI SGR codes; a no-op unless colour is on."""
+    if not COLOR or not codes or not text:
+        return text
+    return "\x1b[%sm%s\x1b[0m" % (";".join(str(c) for c in codes), text)
+
+
+def vlen(text):
+    """Printed width of a string, ignoring ANSI escapes."""
+    return len(ANSI_RE.sub("", text))
+
+
+def pad(text, width):
+    """Left-justify to `width` printed columns, ANSI-aware."""
+    return text + " " * max(0, width - vlen(text))
+
+
+def row(left, right, width=BLOCK_WIDTH):
+    """`left` with `right` flushed to the end of the line."""
+    return left + " " * max(2, width - vlen(left) - vlen(right)) + right
+
+
+def dash():
+    return "-" if ASCII else "\u2013"
+
+
+def dot():
+    return "  " if ASCII else " \u00b7 "
+
+
+def band_label(percent):
+    """Gauge band name for a state-of-charge reading."""
+    for low, _high, label in GAUGE_BANDS:
+        if percent >= low:
+            return label
+    return "critical"
+
+
+def band_bar(soc_low, soc_high, width=BAR_WIDTH):
+    """Charge bar that refuses to fake precision.
+
+    Solid cells are charge we can prove is present, shaded cells are the band
+    the true value is hiding in, and the rest is definitely consumed. For a
+    fine-grained gauge soc_low == soc_high and the bar is exact.
+    """
+    filled = round(soc_low * width / 100)
+    shaded = max(0, round(soc_high * width / 100) - filled)
+    empty = max(0, width - filled - shaded)
+    solid, shade, blank = ("=", "-", ".") if ASCII else ("\u2588", "\u2592", "\u2591")
+    color = BAND_COLOR.get(band_label(soc_low), 37)
+    return (style(solid * filled, color)
+            + style(shade * shaded, color, 2)          # dim: the uncertain band
+            + style(blank * empty, 90, 2))             # dim grey: gone
+
+
+def render_block(r):
+    """A multi-line block for one device."""
+    if r.get("asleep"):
+        return "\n".join([
+            row("  " + style(r["name"], 1), style(r["battery"], 90)),
+            "  %s  %s%s%s" % (band_bar(0, 0), style("no reading", 1, 90), dot(),
+                              style("asleep or switched off", 90)),
+            "",
+            "    " + style("press a key or move it, then re-run", 90),
+        ])
+
+    band = band_label(r["soc_low"])
+    color = BAND_COLOR.get(band, 37)
+    reading = ("%d%%" % r["reported_percent"] if not r["coarse"]
+               else "%d%s%d%%" % (r["soc_low"], dash(), r["soc_high"]))
+    status = r["status"]
+    charging = status in ("recharging", "slow recharge")
+    mark = "\u26a1 " if charging and not ASCII else ""
+    lines = [
+        row("  " + style(r["name"], 1), style(r["battery"], 90)),
+        "  %s  %s%s%s%s%s" % (band_bar(r["soc_low"], r["soc_high"]),
+                              mark + style(band, 1, color), dot(), reading,
+                              dot(), style(status, 36 if charging else 90)),
+        "",
+    ]
+
+    rows = [(sc["label"], fmt_range(sc["days_low"], sc["days_high"]), "")
+            for sc in r["scenarios"]]
+    if "months_off" in r:
+        rows.append(("switched off", fmt_months(r["months_off"]),
+                     "self-discharge only" if r["rechargeable"]
+                     else "shelf life, not a charge"))
+    if "active_hours_low" in r:
+        rows.append(("active movement",
+                     "~" + fmt_pair(r["active_hours_low"], r["active_hours_high"], "h"),
+                     "fitted, not measured"))
+    if "self_share_low" in r:
+        rows.append(("self-discharge", "%.2f%%/month" % r["self_pct_per_month"],
+                     "eats %g%s%g%% of a charge"
+                     % (r["self_share_low"], dash(), r["self_share_high"])))
+    if not rows:
+        rows.append(("runtime", "no model", "add this device to MODELS"))
+    for label, value, note in rows:
+        line = "    %s %s" % (style(pad(label, LABEL_WIDTH), 90), pad(value, VALUE_WIDTH))
+        if note:
+            line += style(note, 90)
+        lines.append(line.rstrip())
+
+    gauge = ("%d-level gauge" % r["gauge_levels"]) if r["gauge_levels"] else "unknown gauge"
+    gauge += ("%sshaded cells = uncertainty" % dot() if r["coarse"]
+              else "%sthe bar is exact" % dot())
+    lines.append("    " + style(gauge, 90))
+    return "\n".join(lines)
+
+
+def render_title(count):
+    """Header line plus a rule of matching width."""
+    text = "  Logitech Unifying receiver%s%d device%s" % (dot(), count,
+                                                          "" if count == 1 else "s")
+    return text + "\n  " + ("-" if ASCII else "\u2500") * (vlen(text) - 2)
+
+
+def frame_sizes(buf):
+    """Yield (offset, length) of each complete HID++ frame. A reply may use a
+    different report id than its request, so we only trust the length field."""
+    i = 0
+    while i < len(buf):
+        n = 7 if buf[i] == RID_SHORT else 20 if buf[i] == RID_LONG else 1
+        if i + n > len(buf):
+            return
+        yield i, n
+        i += n
+
+
+class Receiver:
+    """Minimal HID++ 2.0 client for one Logitech receiver.
+
+    Frame layout: [report id][device index][feature index][fn<<4 | software
+    id][params...]. An empty slot and a sleeping device both answer instantly
+    with HID++ error 0x09, so retrying cannot tell them apart - only the
+    receiver's pairing register can (see name()). We ask every slot anyway,
+    since a slot that does answer needs no further probing.
+    """
+
+    def __init__(self, device):
+        self.dev = device
+        self.q = b""                      # FIFO of unread input reports
+        self._loop = cfstr("kCFRunLoopDefaultMode")
+        self._keep = InputCB(self._on_report)   # keep the callback alive
+        if IOHIDDeviceOpen(device, 0):                # 0 == shared, no prompt
+            IOHIDDeviceOpen(device, 1)                # 1 == seize
+        self._buf = (c_uint8 * 64)()
+        IOHIDDeviceScheduleWithRunLoop(device, CFRunLoopGetCurrent(), self._loop)
+        IOHIDDeviceRegisterInputReportCallback(device, self._buf, 64, self._keep, None)
+
+    def close(self):
+        IOHIDDeviceClose(self.dev, 0)
+
+    # ---- transport -------------------------------------------------------
+    def _on_report(self, _ctx, _res, _snd, _type, _rid, report, length):
+        # runs on the run-loop thread that _wait pumps -> no locking needed
+        if 0 < length <= 64:
+            self.q += bytes(report[:length])
+
+    def _send(self, frame):
+        IOHIDDeviceSetReport(self.dev, 1, frame[0],
+                             (c_uint8 * len(frame))(*frame), len(frame))
+
+    def _wait(self, matches, timeout=2.0):
+        """Pop the first queued frame for which matches() is true."""
+        deadline = time.monotonic() + timeout
+        while True:
+            for off, n in frame_sizes(self.q):
+                f = self.q[off:off + n]
+                if matches(f):
+                    self.q = self.q[:off] + self.q[off + n:]
+                    return f
+            if time.monotonic() >= deadline:
+                return None
+            CFRunLoopRunInMode(self._loop, 0.005, True)
+
+    def request(self, dev_idx, feat_idx, func, params=b""):
+        """One HID++ request -> (params, status). status is None on success,
+        an int HID++ error code, or TIMEOUT if nothing answered."""
+        long_ = len(params) > 3
+        head = bytes([RID_LONG if long_ else RID_SHORT, dev_idx, feat_idx,
+                      (func << 4) | SW_ID])
+        frame = (head + params).ljust(20 if long_ else 7, b"\0")
+        want = (func << 4) | SW_ID
+        if VERBOSE:
+            print("   TX  " + frame.hex(" "), file=sys.stderr)
+        self._send(frame)
+
+        def matches(f):
+            if f[1] != dev_idx:
+                return False
+            # Error replies shift right: [0x8F][orig feat][orig fn<<4|sw][err][0]
+            if f[2] == ERR_MARKER:
+                return len(f) >= 6 and f[3] == feat_idx and f[4] == want
+            return len(f) >= 4 and f[2] == feat_idx and f[3] == want
+
+        reply = self._wait(matches)
+        if reply is None:
+            if VERBOSE:
+                print("   --  timeout", file=sys.stderr)
+            return None, TIMEOUT
+        if VERBOSE:
+            print("   RX  " + reply.hex(" "), file=sys.stderr)
+        if reply[2] == ERR_MARKER:
+            return None, (reply[5] if len(reply) > 5 else -1)
+        return reply[4:], None
+
+    # ---- device level ----------------------------------------------------
+    def feature_index(self, dev_idx, feature_id):
+        """ROOT.GetFeature(feature id) -> index (0 = unsupported, -1 = timeout)."""
+        reply, err = self.request(dev_idx, 0x00, 0x00,
+                                  bytes([feature_id >> 8, feature_id & 0xFF]))
+        if err is TIMEOUT:
+            return -1
+        return 0 if err is not None or reply is None else reply[0]
+
+    def _battery_once(self, dev_idx):
+        """One attempt. -> ((percent, status) or None, timed_out)"""
+        timed_out = False
+        for feat, fn in ((FEAT_BATTERY_ST, 0), (FEAT_UNIFIED_BATT, 1)):
+            idx = self.feature_index(dev_idx, feat)
+            if idx < 0:                    # no reply at all: device asleep
+                timed_out = True
+                continue
+            if idx == 0:                   # HID++ error: feature not present
+                continue
+            reply, err = self.request(dev_idx, idx, fn)
+            if err is TIMEOUT:
+                timed_out = True
+                continue
+            if err is not None or not reply:
+                continue
+            if feat == FEAT_UNIFIED_BATT:
+                pct = LEVEL_FLAGS.get(reply[1] if len(reply) > 1 else 8, 5)
+            else:
+                pct = reply[0]
+            return (pct, (reply[2] if len(reply) > 2 else 0)), timed_out
+        return None, timed_out
+
+    def battery(self, dev_idx, attempts=3):
+        """-> (percent, status) or None. Retries a timeout, which is what a
+        device mid-wake looks like; an instant error reply is definitive and
+        means the slot is empty or the device is asleep (see name())."""
+        for _ in range(attempts):
+            result, timed_out = self._battery_once(dev_idx)
+            if not timed_out:
+                return result
+        return None
+
+    def capability(self, dev_idx):
+        """0x1000 fn 1 GetBatteryCapability -> (levels, flags, critical%).
+        `levels` is how many distinct steps the gauge can report; below 10 the
+        firmware collapses it to the 4 bands in GAUGE_BANDS."""
+        idx = self.feature_index(dev_idx, FEAT_BATTERY_ST)
+        if not idx:
+            return None
+        reply, err = self.request(dev_idx, idx, 0x01)
+        if err is not None or not reply or len(reply) < 5:
+            return None
+        return reply[0], reply[1], reply[4]
+
+    def name(self, slot, attempts=2, timeout=0.4):
+        """Paired devices are named in receiver register 0xB5, sub-register
+        0x40+slot. Reply payload is [sub-register echo, length, name...].
+
+        The name lives in the *receiver*, not the device, so it answers even
+        while the device sleeps (measured: ~2 ms for a paired slot, but an
+        empty slot never answers). That makes a short timeout a cheap way to
+        ask "is anything paired here?".
+        """
+        for _ in range(attempts):
+            frame = bytes([RID_SHORT, 0xFF, 0x83, 0xB5, 0x40 + slot, 0x00, 0x00])
+            if VERBOSE:
+                print("   TX  " + frame.hex(" "), file=sys.stderr)
+            self._send(frame)
+            reply = self._wait(lambda f: len(f) >= 20 and f[1] == 0xFF
+                               and f[2] == 0x83 and f[3] == 0xB5, timeout=timeout)
+            if reply is not None:
+                if VERBOSE:
+                    print("   RX  " + reply.hex(" "), file=sys.stderr)
+                return reply[6:6 + reply[5]].decode(errors="replace")
+        return None
+
+
+def main(argv):
+    global VERBOSE, ASCII, COLOR
+    json_mode, brief, days_override = False, False, None
+    args = list(argv[1:])
+    if "--days" in args:                      # override the runtime assumption
+        i = args.index("--days")
+        days_override = float(args[i + 1])
+        del args[i:i + 2]
+    for a in args:
+        if a in ("-v", "--verbose"):
+            VERBOSE = True
+        elif a == "--json":
+            json_mode = True
+        elif a in ("-b", "--brief"):
+            brief = True
+        elif a == "--ascii":
+            ASCII = True
+        elif a in ("-h", "--help"):
+            print(__doc__)
+            return 0
+        else:
+            print("usage: mxbattery [-v] [--json] [-b] [--ascii] [--days N]",
+                  file=sys.stderr)
+            return 2
+    # Colour for a human on a real terminal only, and never around JSON.
+    COLOR = (not json_mode and sys.stdout.isatty()
+             and os.environ.get("NO_COLOR") is None
+             and os.environ.get("TERM", "") != "dumb")
+
+    devices = find_receivers()
+    if not devices:
+        print("no Logitech HID++ receiver found (usage page 0x%02X).\n"
+              "Is the Unifying receiver plugged in? Check:\n"
+              "  ioreg -p IOUSB | grep -i logitech" % HIDPP_PAGE, file=sys.stderr)
+        return 1
+
+    results = []
+    for dev in devices:                    # a hub may carry several receivers
+        rx = Receiver(dev)
+        for slot in range(1, 7):           # receiver slots 1..6
+            batt = rx.battery(slot)
+            if batt is None:
+                # Nothing answered. Ask the receiver whether anything is paired
+                # here: a sleeping device is still listed, an empty slot is not.
+                # Worth reporting, because a silently missing device looks like
+                # a bug in this script rather than a sleeping keyboard.
+                # A paired slot answers in ~2 ms while an empty one never
+                # answers at all, so a 60 ms timeout is ~30x margin and keeps
+                # a four-slot sweep under a quarter second.
+                asleep = rx.name(slot - 1, attempts=1, timeout=0.06)
+                if asleep:
+                    results.append({"name": asleep, "slot": slot, "asleep": True,
+                                    "battery": model_for(asleep)[0]})
+                continue
+            pct, status = batt
+            name = rx.name(slot - 1) or "device %d" % slot
+            cap = rx.capability(slot)
+            battery, capacity, self_a, active_a, scenarios = model_for(name)
+            if days_override is not None:
+                scenarios = (("powered on (assumed)", days_override, days_override),)
+
+            levels = cap[0] if cap else None
+            flags = cap[1] if cap else 0
+            # < 10 levels (or mileage off) means the firmware reports 4 coarse
+            # bands, so the reading is a range rather than a number.
+            coarse = levels is None or levels < 10 or not (flags & CAP_MILEAGE)
+            soc_lo, soc_hi, band = band_for(pct) if coarse else (pct, pct, None)
+
+            entry = {
+                "name": name,
+                "slot": slot,
+                # What the gauge reported. For a coarse gauge this is a band
+                # representative, NOT a measurement - use soc_low/soc_high.
+                "reported_percent": int(pct),
+                "status": BATTERY_STATUS[status] if status < len(BATTERY_STATUS) else str(status),
+                "battery": battery,
+                "gauge_levels": levels,
+                "rechargeable": bool(flags & CAP_RECHARGEABLE),
+                "coarse": coarse,
+                "band": band,
+                "soc_low": soc_lo,
+                "soc_high": soc_hi,
+                "scenarios": [
+                    {"label": lbl, "days_low": round(lo, 1), "days_high": round(hi, 1)}
+                    for lbl, lo, hi in fmt_scenarios(scenarios, soc_lo, soc_hi)],
+            }
+            if capacity and self_a:
+                # What is left once you stop switching it on, and how much of a
+                # charge leaks away unused across the scenarios above.
+                pairs = fmt_scenarios(scenarios, soc_lo, soc_hi)
+                entry["months_off"] = round(shelf_months(capacity, self_a), 1)
+                entry["self_pct_per_month"] = round(pct_per_month(self_a, capacity), 2)
+                entry["self_share_low"] = round(
+                    self_share(self_a, capacity, min(lo for _, lo, _ in pairs)), 1)
+                entry["self_share_high"] = round(
+                    self_share(self_a, capacity, max(hi for _, _, hi in pairs)), 1)
+            if capacity and active_a:
+                entry["active_hours_low"] = round(active_hours(soc_lo, capacity, active_a))
+                entry["active_hours_high"] = round(active_hours(soc_hi, capacity, active_a))
+            results.append(entry)
+        rx.close()
+        if results and not json_mode:      # stop at the first busy receiver
+            break
+
+    if json_mode:
+        print(json.dumps(results, indent=2))
+        return 0 if any(not r.get("asleep") for r in results) else 1
+    if not results:
+        print("receiver found but nothing is paired to it", file=sys.stderr)
+        return 1
+    if brief:                              # one line per device
+        for r in results:
+            if r.get("asleep"):
+                print("  %s %s  %s %s" % (pad(style(r["name"], 1), 13),
+                                          band_bar(0, 0),
+                                          pad(style("asleep", 1, 90), 9),
+                                          style("press a key, then re-run", 90)))
+                continue
+            band = band_label(r["soc_low"])
+            est = (fmt_range(r["scenarios"][0]["days_low"], r["scenarios"][0]["days_high"])
+                   if r["scenarios"] else style("no model", 90))
+            print("  %s %s  %s %s" % (pad(style(r["name"], 1), 13),
+                                      band_bar(r["soc_low"], r["soc_high"]),
+                                      pad(style(band, 1, BAND_COLOR.get(band, 37)), 9),
+                                      est))
+        return 0 if any(not r.get("asleep") for r in results) else 1
+
+    n = len(results)
+    print(render_title(n))
+    print()
+    print("\n\n".join(render_block(r) for r in results))
+    # A device we could not read is not a success, however many are paired.
+    return 0 if any(not r.get("asleep") for r in results) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

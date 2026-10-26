@@ -1,0 +1,5 @@
+.DS_Store
+/LogiBattery.app/
+/app/build/
+__pycache__/
+*.pyc
